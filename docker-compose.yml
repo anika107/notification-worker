@@ -1,0 +1,68 @@
+services:
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: notifications
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d notifications"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    command: node server.js
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_PASSWORD: postgres
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: node worker.js
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_PASSWORD: postgres
+      WORKER_CONCURRENCY: 5
+      PG_POOL_MAX: 10
+      HASH_MAX_THREADS: 2
+      IMAGE_MAX_THREADS: 2
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - output-data:/app/output
+
+volumes:
+  redis-data:
+  pg-data:
+  output-data:
