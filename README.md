@@ -326,6 +326,145 @@ open http://localhost:3000/admin/queues
 - **Unrecoverable errors** (missing fields, bad paths) are thrown as BullMQ `UnrecoverableError` so they are not retried and go straight to the DLQ.
 - **Graceful shutdown** on `SIGINT`/`SIGTERM` closes the worker, destroys Piscina pools, quits Redis/Postgres connections, then exits.
 
+## System Architecture
+
+The service follows a **queue-based background job pattern**. The API never sends notifications directly — it persists the request and enqueues a job, while a separate worker process handles delivery asynchronously.
+
+### High-level diagram
+
+```mermaid
+flowchart TD
+    Client([Client / API Consumer]) -->|HTTP POST /notify| API[Express API server.js]
+    API -->|1. Validate Zod schema| VALID[Request Validation]
+    VALID -->|2. Insert row + idempotency check| DB[(PostgreSQL<br/>notifications table)]
+    DB -->|Row returned| API
+    API -->|3. Enqueue BullMQ job| Q[(Redis + BullMQ<br/>notifications queue)]
+    Q -->|4. Consume / poll| Worker[BullMQ Worker worker.js]
+    Worker -->|5a. CPU-heavy: hash / resize| Pool[Piscina Worker Thread Pools]
+    Worker -->|5b. Send notification| External[Email / Push / SMS Providers]
+    Worker -->|6. Update status| DB
+    Worker -->|7. Failed after retries| DLQ[(Dead Letter Queue<br/>notifications-dlq)]
+    Scheduler[Job Scheduler schedules.js] -.->|Cron: daily 09:00 UTC| Q
+    Dashboard[Bull Board Dashboard<br/>/admin/queues] -.->|Monitor & retry| Q
+    Dashboard -.->|Basic Auth| Dashboard
+```
+
+### Component responsibilities
+
+| Component | Responsibility |
+|-----------|----------------|
+| **Express API** (`server.js`) | Receives HTTP requests, validates input, writes to PostgreSQL, enqueues BullMQ jobs. Stateless and horizontally scalable. |
+| **BullMQ Worker** (`worker.js`) | Long-running process that consumes jobs from Redis, dispatches to the correct handler (email / push / SMS / hash / resize), and handles retries + DLQ. |
+| **PostgreSQL** (`src/db.js`) | Source of truth for notification records. Stores recipient, payload, status, idempotency key, and timestamps. Auto-creates schema on startup. |
+| **Redis** | BullMQ job store and broker. Holds waiting/active/completed/failed job states. |
+| **Piscina Thread Pools** (`hash-pool.js`, `image-pool.js`) | Offloads CPU-intensive work (pbkdf2 hashing, sharp image resize) to worker threads so the main event loop never blocks. |
+| **Job Scheduler** (`schedules.js`) | Registers cron-based recurring jobs (e.g. daily digest at 09:00 UTC). |
+| **Bull Board Dashboard** | Web UI to visualize queue depth, retry failed jobs, and inspect the DLQ. Protected by Basic Auth. |
+
+---
+
+## Request Lifecycle
+
+Here is what happens when a client calls `POST /notify`:
+
+1. **Auth** — `x-api-key` header is verified with constant-time comparison.
+2. **Rate limit** — Request is checked against the per-IP window limit.
+3. **Validation** — Body is validated against a Zod schema (`notifySchema`).
+4. **Persist** — A row is inserted into `notifications` with an `idempotency_key`. If the key already exists, the existing record is returned (duplicate detection).
+5. **Enqueue** — A BullMQ job (`send-email`) is pushed to Redis with a deterministic `jobId`.
+6. **Respond** — API immediately returns `{ status: "queued", id }` to the client.
+7. **Process** — The worker picks up the job, sends the email, then updates the notification status to `sent` (or moves to DLQ on permanent failure).
+
+---
+
+## Tech Stack & Rationale
+
+| Technology | Role | Why it was chosen |
+|------------|------|-------------------|
+| **Node.js / Express** | API server | Fast, familiar, non-blocking I/O for HTTP handling. |
+| **BullMQ + Redis** | Job queue | Persistent, retryable, priority-aware queues with built-in concurrency and delay scheduling. |
+| **PostgreSQL (pg)** | Notification store | ACID transactions, unique idempotency index, JSONB payloads. |
+| **Piscina** | Worker thread pools | Runs CPU-heavy `pbkdf2` and `sharp` in separate threads without blocking the event loop. |
+| **Zod** | Request validation | Type-safe schema validation with clear error messages. |
+| **Nodemailer** | Email transport | SMTP client with Mailtrap sandbox support for safe local testing. |
+| **Bull Board** | Queue dashboard | Operational visibility into job states without building a custom admin UI. |
+| **Docker / Compose** | Containerization | Reproducible local dev environment with Redis + PostgreSQL. |
+
+---
+
+## Database Schema
+
+On startup, `src/db.js` runs this migration automatically:
+
+```sql
+CREATE TABLE IF NOT EXISTS notifications (
+  id          SERIAL PRIMARY KEY,
+  type        TEXT NOT NULL,          -- email | push | sms
+  recipient   TEXT,
+  payload     JSONB,                  -- subject, message, etc.
+  status      TEXT NOT NULL DEFAULT 'queued',
+  error       TEXT,
+  created_at  TIMESTAMPTZ DEFAULT now(),
+  updated_at  TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS notifications_idem_key
+  ON notifications (idempotency_key);
+```
+
+**Status lifecycle:** `queued` → `retrying` (on transient failure) → `sent` (success) or `dead` (exhausted retries / unrecoverable error).
+
+---
+
+## Design Decisions & Trade-offs
+
+| Decision | Reasoning | Trade-off |
+|----------|-----------|-----------|
+| **Async queue instead of inline sending** | Prevents slow SMTP/SMS providers from blocking the API. | Adds eventual consistency; client doesn't know immediately if delivery succeeded. |
+| **Idempotency keys** | Guarantees at-least-once semantics without duplicate notifications. | Clients must generate and store unique keys. |
+| **BullMQ over in-memory queue** | Jobs survive restarts; supports retries, delays, and DLQ. | Requires operating Redis. |
+| **Piscina thread pools** | `pbkdf2` and `sharp` are CPU-bound and would block Node's single thread. | Extra memory for thread pools; slight serialization overhead. |
+| **Fail-closed auth** | If `API_KEY` is missing, all routes return 500 instead of opening access. | Misconfigured env blocks the API until fixed. |
+| **UnrecoverableError** | Missing fields or path-traversal attempts are not retried; they go straight to DLQ. | Requires correct error typing in job handlers. |
+| **Graceful shutdown** | `SIGINT`/`SIGTERM` closes worker, pools, and DB connections before exit. | Slightly more complex process lifecycle. |
+
+---
+
+## Scalability & Production Considerations
+
+- **Stateless API** — `server.js` stores no local state; you can run multiple replicas behind a load balancer.
+- **Worker concurrency** — Tunable via `WORKER_CONCURRENCY`. Increase if workers are I/O-bound (waiting on SMTP/SMS).
+- **Thread pools** — `HASH_MAX_THREADS` and `IMAGE_MAX_THREADS` cap CPU-heavy concurrency so the server doesn't overload.
+- **Rate limiting** — `express-rate-limit` protects against brute-force and spam.
+- **Redis single point of failure** — In production, use Redis Cluster or a managed Redis with failover.
+- **Database connections** — `pg` Pool with `max` and `idleTimeoutMillis` prevents connection exhaustion.
+- **Graceful shutdown** — Critical for zero-detployment deployments (Kubernetes `SIGTERM`).
+
+---
+
+## Security
+
+- **API key auth** — `crypto.timingSafeEqual` prevents timing attacks on `x-api-key`.
+- **Dashboard auth** — Basic Auth with hashed comparison; returns `401` + `WWW-Authenticate` header.
+- **Path traversal protection** — Resized images are resolved inside `./images` only; `../../.env` style attacks are rejected.
+- **Fail-closed** — Missing credentials refuse access rather than allowing it.
+- **Input validation** — Zod schemas bound string lengths and reject malformed payloads.
+
+---
+
+## Future Improvements
+
+- [ ] Add unit + integration tests (Jest / supertest)
+- [ ] Add request tracing IDs and structured logging (Pino)
+- [ ] Add Prometheus metrics for queue depth, job duration, error rate
+- [ ] WebSocket / SSE endpoint for real-time delivery status
+- [ ] Multi-channel fallback (email → push → SMS)
+- [ ] Kubernetes manifests + Helm chart
+- [ ] Scheduled digest aggregation (batch multiple notifications into one email)
+
+---
+
 ## License
 
 ISC
